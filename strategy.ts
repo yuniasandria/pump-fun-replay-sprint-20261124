@@ -112,14 +112,8 @@ const LAMPORTS = 1e9;
 /** Curve fee share (protocol 95 bps + creator 30 bps) taken off a sell's quote. */
 const CURVE_FEE = 0.0125;
 const BPS_PER_UNIT = 10_000;
-
-interface Trade {
-  slot: number;
-  buy: boolean;
-  sol: number;
-  user: string;
-  price: number;
-}
+/** Shared empty pending map: pending orders are usually none. Never mutated. */
+const EMPTY_PENDING: Map<Pubkey, number> = new Map();
 
 interface Tape {
   created: number | null;
@@ -128,7 +122,33 @@ interface Tape {
   creatorSold: boolean;
   /** Distinct non-creator buyers whose buy landed in the create slot. */
   earlyBuyers: Set<string>;
-  trades: Trade[];
+  /**
+   * Opening-tape aggregates, kept running per trade instead of re-scanning a
+   * stored tape on every decision. They equal the scan over the tape exactly:
+   * decisions only happen at age 0-1, and no trade of a curve that young can
+   * be older than the 65-slot prune window (the dev window has no trade
+   * before its mint's CreateEvent and one CreateEvent per mint), so nothing
+   * the scan would see is ever missing here. Summation order is arrival
+   * order, the same order the scan summed in, so the floats match bit for
+   * bit.
+   */
+  buySol: number;
+  sellSol: number;
+  buys: number;
+  /** Distinct non-creator buyers, by arrival-time creator (see note above). */
+  buyers: Set<string>;
+  /** Price of the first trade (-1 until the first trade) and of the latest. */
+  firstPrice: number;
+  lastPrice: number;
+  /**
+   * Pyramid flow: signed SOL per trade in arrival order (buy +sol, sell
+   * -sol) with its slot, read through a head index. The flow sum over the
+   * last 30 slots is summed fresh from the window on read, in arrival order,
+   * so it matches the old scan over the tape bit for bit.
+   */
+  flowSlots: number[];
+  flowSols: number[];
+  flowHead: number;
   entries: number;
   lastExit: number;
 }
@@ -150,6 +170,8 @@ export function createStrategy(p: Params = DEFAULT_PARAMS): Bot {
   const probes = new Map<Pubkey, boolean>();
   /** The bot's own filled orders and the coins they were on (harness closes excluded). */
   let myFills = 0;
+  /** Tx fee in lamports, cached on the first batch (fees never change mid-run). */
+  let txFeeBig: bigint | null = null;
   const myCoins = new Set<Pubkey>();
   let firstTime: number | null = null;
   let lastTime: number | null = null;
@@ -163,7 +185,15 @@ export function createStrategy(p: Params = DEFAULT_PARAMS): Bot {
         creatorBuy: 0,
         creatorSold: false,
         earlyBuyers: new Set<string>(),
-        trades: [],
+        buySol: 0,
+        sellSol: 0,
+        buys: 0,
+        buyers: new Set<string>(),
+        firstPrice: -1,
+        lastPrice: 0,
+        flowSlots: [],
+        flowSols: [],
+        flowHead: 0,
         entries: 0,
         lastExit: -1e12,
       };
@@ -181,27 +211,10 @@ export function createStrategy(p: Params = DEFAULT_PARAMS): Bot {
     if (t.creatorSold) return false;
     if (t.creatorBuy < p.minDevBuy || t.creatorBuy > p.maxDevBuy) return false;
     if (t.earlyBuyers.size > p.maxEarlyBuyers) return false;
-    let buySol = 0;
-    let sellSol = 0;
-    let buys = 0;
-    const buyers = new Set<string>();
-    let firstPrice = -1;
-    let lastPrice = 0;
-    for (const tr of t.trades) {
-      if (tr.buy) {
-        buySol += tr.sol;
-        buys++;
-        if (tr.user !== t.creator) buyers.add(tr.user);
-      } else {
-        sellSol += tr.sol;
-      }
-      if (firstPrice < 0) firstPrice = tr.price;
-      lastPrice = tr.price;
-    }
-    if (buys < p.minBuys || buyers.size < p.minBuyers) return false;
-    if (buySol - sellSol < p.minNetSol) return false;
-    if (buySol > 0 && sellSol / buySol > p.maxSellRatio) return false;
-    if (firstPrice <= 0 || lastPrice < firstPrice * 0.98) return false;
+    if (t.buys < p.minBuys || t.buyers.size < p.minBuyers) return false;
+    if (t.buySol - t.sellSol < p.minNetSol) return false;
+    if (t.buySol > 0 && t.sellSol / t.buySol > p.maxSellRatio) return false;
+    if (t.firstPrice <= 0 || t.lastPrice < t.firstPrice * 0.98) return false;
     return true;
   };
 
@@ -227,8 +240,28 @@ export function createStrategy(p: Params = DEFAULT_PARAMS): Bot {
         } else if (e.event === 'TradeEvent') {
           const t = tapeOf(e.mint);
           const sol = Number(e.sol_amount) / LAMPORTS;
-          const price = Number(e.virtual_quote_reserves) / Number(e.virtual_token_reserves);
-          t.trades.push({ slot: e.slot, buy: e.is_buy, sol, user: e.user, price });
+          // The opening-tape aggregates are only ever read at age <= maxAge,
+          // so a trade on an older curve cannot change any decision: skip
+          // the whole fold (including the price division) for it. The flow
+          // window is only read for a held curve, and only from 30 slots
+          // after entry on, so a trade before the curve is held can never
+          // be inside a read window either: record flow only while held.
+          if (t.created === null || now - t.created <= p.maxAge) {
+            const price = Number(e.virtual_quote_reserves) / Number(e.virtual_token_reserves);
+            if (e.is_buy) {
+              t.buySol += sol;
+              t.buys++;
+              if (e.user !== t.creator) t.buyers.add(e.user);
+            } else {
+              t.sellSol += sol;
+            }
+            if (t.firstPrice < 0) t.firstPrice = price;
+            t.lastPrice = price;
+          }
+          if (held.has(e.mint)) {
+            t.flowSlots.push(e.slot);
+            t.flowSols.push(e.is_buy ? sol : -sol);
+          }
           traded.add(e.mint);
           if (t.creator !== null && e.user === t.creator) {
             if (e.is_buy) t.creatorBuy += sol;
@@ -238,14 +271,8 @@ export function createStrategy(p: Params = DEFAULT_PARAMS): Bot {
           }
         }
       }
-      // Prune tapes: the entry signal only needs the opening window, but pyramid adds read
-      // flow over the last minute, so keep the last 60 slots of trades per curve.
-      for (const mint of traded) {
-        const t = tapes.get(mint)!;
-        let cut = 0;
-        while (cut < t.trades.length && t.trades[cut]!.slot <= now - 65) cut++;
-        if (cut > 0) t.trades.splice(0, cut);
-      }
+      // No per-trade store to prune any more: the aggregates are running
+      // values and the flow window is read through its head index.
       // Periodic sweep: drop tapes for curves long past their launch window that are not held.
       // Never drop a curve traded in this batch — the entry loop below still needs its tape.
       if (now % 10000 === 0) {
@@ -253,13 +280,25 @@ export function createStrategy(p: Params = DEFAULT_PARAMS): Bot {
           if (!held.has(mint) && !probes.has(mint) && !traded.has(mint) && t.created !== null && now - t.created > 65) tapes.delete(mint);
         }
       }
-      const marks = new Map(batch.marks.map((m) => [m.mint, m] as const));
-      const pendingByMint = new Map<Pubkey, number>();
-      for (const po of state.pending.values()) pendingByMint.set(po.order.mint, (pendingByMint.get(po.order.mint) ?? 0) + 1);
+      // Marks only price held curves and pending orders are usually none:
+      // build neither map on a batch that cannot use it.
+      const marks =
+        batch.marks.length === 0 || held.size === 0
+          ? undefined
+          : new Map(batch.marks.map((m) => [m.mint, m] as const));
+      let pendingByMint: Map<Pubkey, number> = EMPTY_PENDING;
+      if (state.pending.size > 0) {
+        pendingByMint = new Map<Pubkey, number>();
+        for (const po of state.pending.values()) {
+          pendingByMint.set(po.order.mint, (pendingByMint.get(po.order.mint) ?? 0) + 1);
+        }
+      }
 
       const orders: OrderInput[] = [];
       const cap = state.hello.caps.max_orders_per_batch;
-      const tx = Number(state.txFeeLamports()) / LAMPORTS;
+      // The tx fee is constant for the run: pay the BigInt conversion once.
+      const txFee = (txFeeBig ??= state.txFeeLamports());
+      const tx = Number(txFee) / LAMPORTS;
 
       // Exits first.
       for (const [mint, h] of held) {
@@ -276,7 +315,7 @@ export function createStrategy(p: Params = DEFAULT_PARAMS): Bot {
         }
         h.filled = true;
         if (curve === undefined || curve.complete) continue;
-        const mk = marks.get(mint);
+        const mk = marks?.get(mint);
         const vq = mk ? Number(mk.virtual_quote_reserves) : Number(curve.virtual_quote_reserves);
         const vt = mk ? Number(mk.virtual_token_reserves) : Number(curve.virtual_token_reserves);
         const tokens = Number(pos.token_amount);
@@ -316,8 +355,23 @@ export function createStrategy(p: Params = DEFAULT_PARAMS): Bot {
       }
 
       // Then entries.
-      let free = Number(state.freeCashLamports()) / LAMPORTS;
-      let slotsLeft = state.hello.caps.max_open_positions - state.committedPositionCount();
+      // Free cash without the SDK's per-batch call: cash minus the tx fee
+      // and buy amounts of pending orders — the same formula it computes.
+      let freeLamports = state.cash;
+      for (const po of state.pending.values()) {
+        freeLamports -= txFee;
+        if (po.order.side === 'buy') freeLamports -= BigInt(po.order.quote_lamports);
+      }
+      let free = Number(freeLamports) / LAMPORTS;
+      // Committed positions without the SDK's per-batch Set: the bot never
+      // holds two pending buys on one mint (entries, pyramid adds and probes
+      // all skip a mint with a pending order), so counting pending buys not
+      // already held equals the distinct-mint count exactly.
+      let committed = state.positions.size;
+      for (const po of state.pending.values()) {
+        if (po.order.side === 'buy' && !state.positions.has(po.order.mint)) committed++;
+      }
+      let slotsLeft = state.hello.caps.max_open_positions - committed;
       let mainLeft = p.maxMain - held.size;
       let exposure = 0;
       for (const [mint, h] of held) exposure += Math.max(h.invested, Number(state.positions.get(mint)?.cost_lamports ?? 0n) / LAMPORTS);
@@ -355,7 +409,7 @@ export function createStrategy(p: Params = DEFAULT_PARAMS): Bot {
         const curve = state.curves.get(mint);
         if (pos === undefined || curve === undefined || curve.complete) continue;
         if (pendingByMint.has(mint)) continue;
-        const mk = marks.get(mint);
+        const mk = marks?.get(mint);
         const vq = mk ? Number(mk.virtual_quote_reserves) : Number(curve.virtual_quote_reserves);
         const vt = mk ? Number(mk.virtual_token_reserves) : Number(curve.virtual_token_reserves);
         const tokens = Number(pos.token_amount);
@@ -363,8 +417,9 @@ export function createStrategy(p: Params = DEFAULT_PARAMS): Bot {
         const cost = Number(pos.cost_lamports) / LAMPORTS;
         if (value < cost * (1 + p.addGain)) continue;
         const t = tapeOf(mint);
+        while (t.flowHead < t.flowSlots.length && t.flowSlots[t.flowHead]! <= now - 30) t.flowHead++;
         let flow = 0;
-        for (const tr of t.trades) if (tr.slot > now - 30) flow += tr.buy ? tr.sol : -tr.sol;
+        for (let i = t.flowHead; i < t.flowSlots.length; i++) flow += t.flowSols[i]!;
         if (flow < 0.1) continue;
         const capSol = Math.floor(Number(state.maxBuyLamports(mint))) / LAMPORTS;
         let amount = Math.min(capSol, p.addSol, p.maxExposureSol - exposure);
